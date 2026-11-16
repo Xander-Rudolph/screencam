@@ -1,0 +1,142 @@
+#!/bin/bash
+# screencam: drag a rectangle on screen and send it to a virtual webcam.
+#
+# Usage:
+#   screencam                  broadcast to the camera "Screen Cam"
+#   screencam "Game Cam"       broadcast to a camera with that name (created if it doesn't exist)
+#   screencam list             show the virtual cameras and which ones are broadcasting
+#   screencam kill             stop every screencam (broadcasting, or still picking an area)
+#   screencam kill NAME        stop just that camera's broadcast
+#   screencam remove NAME      delete a camera (only when nothing is using it)
+#   (--list, --kill, --remove and --help work too; those words can't be used as camera names)
+#
+# Run it in several terminals with different names to have several cameras at once.
+# Stop a broadcast with Ctrl+C. Cameras stay in the device list until reboot or --remove.
+#
+# Settings (environment variables):
+#   OUT=1280x720 screencam     output size (default 1920x1080; the area is scaled to fit, black bars added)
+#   FPS=60 screencam           frame rate (default 30)
+#   BORDER=1 screencam         draw an outline around the captured area (it can block clicks under it)
+#
+# Needs: an X11 session, ffmpeg, slop, v4l-utils, the v4l2loopback kernel module and v4l2loopback-utils.
+# https://github.com/Xander-Rudolph/screencam
+
+FPS=${FPS:-30}
+OUT=${OUT:-1920x1080}
+OW=${OUT%x*} OH=${OUT#*x}
+
+die() { echo "screencam: $*" >&2; exit 1; }
+
+# Print the /dev/videoN of every v4l2loopback device
+loop_devs() {
+    local d
+    for d in /sys/class/video4linux/video*; do
+        [[ -e $d ]] && v4l2-ctl -d "/dev/${d##*/}" -D 2>/dev/null | grep -q 'v4l2 loopback' && echo "/dev/${d##*/}"
+    done
+}
+cam_name() { cat "/sys/class/video4linux/${1##*/}/name"; }
+# Print the device of the virtual camera called $1 (nothing if there isn't one)
+find_cam() {
+    local dev
+    for dev in $(loop_devs); do [[ $(cam_name "$dev") == "$1" ]] && { echo "$dev"; return; }; done
+}
+# Is a screencam broadcasting to device $1?
+live() { pgrep -f "x11grab.* $1\$" >/dev/null; }
+
+[[ $EUID -eq 0 ]] && die "run it without sudo (it asks for the password itself when needed)"
+for t in slop ffmpeg v4l2-ctl; do command -v $t >/dev/null || die "$t is not installed"; done
+
+case $1 in
+    -l|--list|list)
+        devs=$(loop_devs)
+        [[ -n $devs ]] || { echo "no virtual cameras yet"; exit 0; }
+        for dev in $devs; do
+            live "$dev" && s=broadcasting || s=idle
+            printf '%-12s %-26s %s\n' "$dev" "\"$(cam_name "$dev")\"" "$s"
+        done
+        exit 0 ;;
+    -k|--kill|kill)
+        n=0
+        if [[ -n $2 ]]; then
+            dev=$(find_cam "$2"); [[ -n $dev ]] || die "no camera called \"$2\" (see screencam list)"
+            pids=$(pgrep -f "x11grab.* $dev\$")
+        else
+            # screencams still waiting for an area to be picked: stopping their slop makes them exit
+            for p in $(pgrep -x slop); do
+                pp=$(ps -o ppid= -p "$p" | tr -d ' ')
+                grep -q screencam "/proc/$pp/cmdline" 2>/dev/null && kill "$p" 2>/dev/null && kill -CONT "$p" 2>/dev/null &&
+                    { echo "cancelled a screencam that was still picking an area"; ((n++)); }
+            done
+            pids=$(pgrep -f 'x11grab.* /dev/video[0-9]+$')
+        fi
+        for p in $pids; do
+            dev=$(tr '\0' '\n' <"/proc/$p/cmdline" 2>/dev/null | tail -1)
+            # CONT wakes up a paused (stopped) background job so it can act on the TERM
+            kill "$p" 2>/dev/null && kill -CONT "$p" 2>/dev/null &&
+                { echo "stopped \"$(cam_name "$dev" 2>/dev/null)\" ($dev)"; ((n++)); }
+        done
+        # ffmpeg exits cleanly on Ctrl+C/TERM; force anything still running after 3 seconds
+        for _ in {1..30}; do
+            alive=$(for p in $pids; do kill -0 "$p" 2>/dev/null && echo "$p"; done)
+            [[ -z $alive ]] && break; sleep 0.1
+        done
+        [[ -n $alive ]] && kill -9 $alive 2>/dev/null
+        if ((n == 0)); then
+            [[ -n $2 ]] && echo "\"$2\" is not broadcasting" || echo "no screencam running"
+        fi
+        exit 0 ;;
+    -r|--remove|remove)
+        [[ -n $2 ]] || die "usage: screencam remove NAME"
+        dev=$(find_cam "$2"); [[ -n $dev ]] || die "no camera called \"$2\" (see screencam --list)"
+        live "$dev" && die "\"$2\" is still broadcasting; stop that screencam first"
+        sudo v4l2loopback-ctl delete "$dev" || die "couldn't remove \"$2\" (close any app that's using it)"
+        echo "removed \"$2\" ($dev)"
+        exit 0 ;;
+    -h|--help|help)
+        sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; exit 0 ;;
+    -*)
+        die "unknown option $1 (see screencam --help)" ;;
+esac
+
+[[ $XDG_SESSION_TYPE == wayland ]] && die "this only works in an X11 session (you're on Wayland)"
+[[ -n $DISPLAY ]] || die "no X display found (\$DISPLAY is empty)"
+
+NAME=${1:-Screen Cam}
+DEV=$(find_cam "$NAME")
+
+if [[ -z $DEV ]]; then
+    command -v v4l2loopback-ctl >/dev/null || die "v4l2loopback-ctl not found (install v4l2loopback-utils)"
+    # Load the driver with no cameras; they're added one at a time below
+    [[ -e /dev/v4l2loopback ]] || sudo modprobe v4l2loopback devices=0 || exit 1
+    n=10; while [[ -e /dev/video$n ]]; do ((n++)); done
+    echo "Creating camera \"$NAME\" at /dev/video$n"
+    # -x 1: needed for browsers to see it; -b 8: some viewers (e.g. guvcview) need more than 2 buffers
+    sudo v4l2loopback-ctl add -n "$NAME" -x 1 -b 8 "/dev/video$n" >/dev/null || exit 1
+    for _ in {1..30}; do               # wait for udev to set up the device permissions
+        DEV=$(find_cam "$NAME"); [[ -n $DEV && -w $DEV ]] && break; sleep 0.1
+    done
+    [[ -n $DEV && -w $DEV ]] || die "couldn't set up camera \"$NAME\""
+    # Give guvcview the right settings for the new camera, copied from Screen Cam's
+    g=~/.config/guvcview2
+    [[ -f $g/video10 && ! -e $g/${DEV##*/} && $DEV != /dev/video10 ]] && cp "$g/video10" "$g/${DEV##*/}"
+fi
+
+live "$DEV" && die "\"$NAME\" is already broadcasting. Stop it first, or use another name: screencam \"Other Cam\""
+
+# Keep apps that are watching the camera alive between runs: repeat frames / show a blank
+# image during gaps instead of stalling, and don't lock the size from a previous run.
+v4l2-ctl -d "$DEV" -c keep_format=0,sustain_framerate=1,timeout=1500 2>/dev/null
+
+# Drag a rectangle (or click a window) to choose the area; Esc cancels
+geom=$(slop -f "%w %h %x %y") || die "cancelled"
+read -r W H X Y <<<"$geom"
+
+region=()
+[[ $BORDER == 1 ]] && region=(-show_region 1)
+
+echo "Broadcasting ${W}x${H} at +$X,$Y as ${OW}x${OH} to \"$NAME\" ($DEV). Ctrl+C to stop."
+# -nostdin: don't read keys from the terminal, otherwise "screencam NAME &" gets paused by the shell
+exec ffmpeg -nostdin -hide_banner -loglevel warning \
+    -f x11grab -framerate "$FPS" "${region[@]}" -video_size "${W}x${H}" -i "$DISPLAY+$X,$Y" \
+    -vf "scale=${OW}:${OH}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=${OW}:${OH}:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
+    -f v4l2 "$DEV"
