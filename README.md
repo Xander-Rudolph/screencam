@@ -46,6 +46,24 @@ sudo chmod +x /usr/local/bin/screencam
 
 To update, run the same commands again.
 
+### Install with git (easy updates)
+
+Clone the repo and link the script into your `PATH`. Updating is then a `git pull`, and the link picks up the new version straight away.
+
+```sh
+git clone https://github.com/Xander-Rudolph/screencam.git ~/.local/share/screencam
+mkdir -p ~/.local/bin
+ln -sf ~/.local/share/screencam/screencam ~/.local/bin/screencam
+```
+
+To update:
+
+```sh
+git -C ~/.local/share/screencam pull
+```
+
+You can clone it anywhere, as long as the link points at the `screencam` file inside the clone. Keep the clone on a disk that's always mounted, or `screencam` won't be found while that disk isn't mounted.
+
 ## Usage
 
 ```sh
@@ -180,6 +198,7 @@ Each check only works when no other app is watching the camera (see "Device or r
 screencam kill
 screencam remove "Screen Cam"   # repeat for each camera in `screencam list`
 rm ~/.local/bin/screencam
+rm -rf ~/.local/share/screencam   # only if you installed with git
 ```
 
 ## License
