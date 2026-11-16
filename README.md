@@ -81,12 +81,97 @@ Set these as environment variables, for example `OUT=1280x720 FPS=60 screencam "
 - ffmpeg (`x11grab`) captures the area and writes it to the device at a fixed size. Restarting with a different-sized area won't break an app that's watching.
 - Cameras are created in `exclusive_caps` mode, which browsers need to detect them.
 
+## Testing your camera
+
+Run these while screencam is broadcasting. Replace `/dev/video10` with your camera's device from `screencam list`.
+
+**1. Is it broadcasting?**
+
+```sh
+screencam list
+```
+
+**2. Can apps see it?**
+
+```sh
+v4l2-ctl -d /dev/video10 -D | grep -A1 'Device Caps'
+```
+
+`Video Capture` means apps can see it. `Video Output` on its own means nothing is broadcasting to it, or the broadcast is paused (see [Troubleshooting](#troubleshooting)).
+
+**3. Is the format right?**
+
+```sh
+v4l2-ctl -d /dev/video10 --list-formats-ext
+```
+
+You should see `'YU12'` at `1920x1080`, `30.000 fps`, or your `OUT`/`FPS` settings.
+
+**4. Look at it.**
+
+```sh
+ffplay /dev/video10
+```
+
+This opens a live preview window; press `q` to close it. `ffplay` comes with ffmpeg on most distros. For a preview with a photo button, use guvcview (`sudo pacman -S guvcview` / `sudo apt install guvcview`):
+
+```sh
+guvcview -d /dev/video10 -f YU12 -x 1920x1080
+```
+
+Photos save to `~/Pictures`.
+
+**5. Take a picture from the terminal.**
+
+```sh
+ffmpeg -f v4l2 -i /dev/video10 -ss 1 -frames:v 1 snapshot.png
+```
+
+`-ss 1` skips the first second, so you don't get a blank frame from just after the camera opened.
+
+**6. Check the picture isn't black.**
+
+```sh
+ffmpeg -i snapshot.png -vf signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=- -f null - 2>/dev/null | grep YAVG
+```
+
+This prints the average brightness from 0 to 255. Around `16` or lower means the picture is black, because video uses 16 as its black level. A blank frame straight from the driver shows `0`.
+
+**7. Test buffer streaming,** the mode most webcam apps use:
+
+```sh
+v4l2-ctl -d /dev/video10 --stream-mmap=4 --stream-count=30 --stream-to=/dev/null
+```
+
+It prints one `<` per frame. A `VIDIOC_CREATE_BUFS ... Inappropriate ioctl` line is harmless.
+
+Each check only works when no other app is watching the camera (see "Device or resource busy" below).
+
 ## Troubleshooting
 
 - **The camera doesn't show up in my app.** Cameras only appear while they're broadcasting. Start screencam first, then open or refresh the app.
-- **"Device or resource busy".** Only one app can watch a camera at a time. Close the other app or browser tab.
-- **The picture froze after restarting screencam.** Select the camera again in the app.
-- **guvcview complains about the pixel format or resolution.** guvcview remembers settings per device. Start it once with the right ones and it saves them: `guvcview -d /dev/video10 -f YU12 -x 1920x1080`. `screencam list` shows each camera's device.
+- **"Device or resource busy".** Only one app can watch a camera at a time. Find out what has it open, then close that app or browser tab. Browsers can keep the camera open after you leave the page, so you may need to close the browser completely.
+
+  ```sh
+  fuser -v /dev/video10
+  ```
+
+- **`screencam list` says broadcasting, but apps see nothing.** Check whether the broadcast is paused:
+
+  ```sh
+  ps -o stat,args -C ffmpeg
+  ```
+
+  A `T` in the `STAT` column means the shell paused it. screencam runs ffmpeg with `-nostdin` to stop that happening to background jobs (`screencam NAME &`), but if it does happen, run `screencam kill` and start again.
+- **The picture froze after restarting screencam.** Select the camera again in the app. screencam sets the camera to keep sending frames between restarts. To check those settings, run the command below; you should see `keep_format: 0`, `sustain_framerate: 1` and `timeout: 1500`.
+
+  ```sh
+  v4l2-ctl -d /dev/video10 -C keep_format,sustain_framerate,timeout
+  ```
+
+- **guvcview complains about the pixel format or resolution.** guvcview remembers settings per device, so start it once with the right ones: `guvcview -d /dev/video10 -f YU12 -x 1920x1080`.
+- **guvcview shows no picture, with `Unable to query buffer` in its terminal output.** The camera was created with too few buffers. That happens when v4l2loopback was loaded by hand or by another tool with the default `max_buffers=2`; cameras screencam creates have 8. Use read mode: `guvcview -d /dev/video10 -c read`.
+- **guvcview starts but no window appears.** guvcview saves its command-line options into `~/.config/guvcview2/videoN`, including `-g none` and `-r none` (no window, no preview). Make sure that file has `gui=gtk3` and `render=sdl`.
 - **"this only works in an X11 session".** You're on Wayland. Log in with an X11 session instead.
 
 ## Uninstall
